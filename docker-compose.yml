@@ -1,8 +1,10 @@
 # Generic SYCL llama-server. Copy .env.example or examples/z8g4.env to .env.
 #
-# Devices: pass ONLY the chosen Intel render nodes and matching by-path
-# entries. Do not bind all of /dev/dri on hosts that also have NVIDIA / extra
-# Intel nodes (e.g. z8g4).
+# Devices: pass ONLY the chosen Intel render nodes (DRI_RENDER_*).
+# Mount the whole /dev/dri/by-path folder (PCI names contain colons, which
+# break per-device short "src:dst:mode" binds and even some long-syntax
+# interpolations). Do not bind all of /dev/dri on hosts that also have
+# NVIDIA / extra Intel nodes (e.g. z8g4).
 #
 # ipc: host is intentionally omitted. llama-server is a single process using
 # two Level Zero devices; host IPC is a leftover from vLLM multiprocessing
@@ -13,6 +15,8 @@ services:
     build:
       context: .
       target: runtime
+      args:
+        BUILD_JOBS: ${BUILD_JOBS:-24}
     image: ${IMAGE_NAME:-qwen38-b70:latest}
     container_name: ${CONTAINER_NAME:-qwen38-b70}
     restart: unless-stopped
@@ -21,16 +25,9 @@ services:
       - ${DRI_RENDER_0}:/dev/dri/${DRI_RENDER_0_NAME}
       - ${DRI_RENDER_1}:/dev/dri/${DRI_RENDER_1_NAME}
     volumes:
-      # Long bind syntax: PCI by-path names contain colons, which break
-      # the short "src:dst:mode" volume form.
-      - type: bind
-        source: ${DRI_BYPATH_0}
-        target: /dev/dri/by-path/${DRI_BYPATH_0_NAME}
-        read_only: true
-      - type: bind
-        source: ${DRI_BYPATH_1}
-        target: /dev/dri/by-path/${DRI_BYPATH_1_NAME}
-        read_only: true
+      # Whole-folder bind: individual pci-0000:XX:00.0-render names contain
+      # colons and make Compose report "invalid volume specification".
+      - /dev/dri/by-path:/dev/dri/by-path:ro
       - type: bind
         source: ${HOST_MODELS_DIR}
         target: /models
@@ -60,11 +57,16 @@ services:
       MTP_SHA256: ${MTP_SHA256:-}
       MMPROJ_FILE: ${MMPROJ_FILE:-mmproj-Qwen3.8-27B-Q8_0.gguf}
       MMPROJ_SHA256: ${MMPROJ_SHA256:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      LLAMA_API_KEY: ${LLAMA_API_KEY:-}
+      GGML_SYCL_COMM_SINGLE_KERNEL: ${GGML_SYCL_COMM_SINGLE_KERNEL:-1}
+      GGML_SYCL_COMM_DIRECT_Q8: ${GGML_SYCL_COMM_DIRECT_Q8:-2}
+      GGML_SYCL_DEV2DEV_MEMCPY: ${GGML_SYCL_DEV2DEV_MEMCPY:-0}
     shm_size: ${SHM_SIZE:-8g}
     ports:
       - "${HOST_PORT:-8016}:${PORT:-8016}"
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c 'import os,urllib.request as u; u.urlopen(\"http://127.0.0.1:%s/health\" % os.environ.get(\"PORT\",\"8016\"))'"]
+      test: ["CMD-SHELL", "python3 -c 'import os,urllib.request as u; req=u.Request(\"http://127.0.0.1:%s/health\" % os.environ.get(\"PORT\",\"8016\")); k=os.environ.get(\"LLAMA_API_KEY\"); req.add_header(\"Authorization\", \"Bearer \"+k) if k else None; u.urlopen(req)'"]
       interval: 30s
       timeout: 10s
       retries: 20

@@ -21,6 +21,10 @@ if [ -d /dev/dri/by-path ]; then
   echo
   echo "Copy DRI_RENDER_* and DRI_BYPATH_* from the pci-*-render lines for the B70s."
   echo "Example: pci-0000:17:00.0-render -> ../renderD129"
+  echo
+  echo "Render node numbers can change after a reboot; PCI addresses do not."
+  echo "Recheck DRI_RENDER_* against this listing, or run:"
+  echo "  ./scripts/resolve-dri-from-bypath.sh --write .env"
 else
   echo "no /dev/dri/by-path"
 fi

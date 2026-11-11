@@ -51,9 +51,13 @@ RUN cd /build/llama.cpp \
         -DGGML_SYCL_SUPPORT_LEVEL_ZERO_API=ON
 
 FROM cmake-configure AS runtime
+# -j$(nproc) is unsafe on large hosts: -j88 froze z8g4 (88 cores, 231 GB RAM)
+# during the SYCL build. -j24 finished in 287.9 s with ~40 GB RAM used.
+# Override at build time: docker compose build --build-arg BUILD_JOBS=16
+ARG BUILD_JOBS=24
 RUN cd /build/llama.cpp \
     && . /opt/intel/oneapi/setvars.sh --force \
-    && cmake --build build-sycl --target llama-server -j"$(nproc)"
+    && cmake --build build-sycl --target llama-server -j"${BUILD_JOBS}"
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

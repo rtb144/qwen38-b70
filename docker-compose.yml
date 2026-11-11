@@ -1,31 +1,71 @@
+# Generic SYCL llama-server. Copy .env.example or examples/z8g4.env to .env.
+#
+# Devices: pass ONLY the chosen Intel render nodes and matching by-path
+# entries. Do not bind all of /dev/dri on hosts that also have NVIDIA / extra
+# Intel nodes (e.g. z8g4).
+#
+# ipc: host is intentionally omitted. llama-server is a single process using
+# two Level Zero devices; host IPC is a leftover from vLLM multiprocessing
+# and is not required for this path. shm_size is kept for SYCL/USM staging.
+
 services:
-  qwen38-b70:
-    build: .
-    image: qwen38-b70:latest
-    container_name: qwen38-b70
+  llama-sycl:
+    build:
+      context: .
+      target: runtime
+    image: ${IMAGE_NAME:-qwen38-b70:latest}
+    container_name: ${CONTAINER_NAME:-qwen38-b70}
     restart: unless-stopped
+    init: true
     devices:
-      - /dev/dri:/dev/dri
+      - ${DRI_RENDER_0}:/dev/dri/${DRI_RENDER_0_NAME}
+      - ${DRI_RENDER_1}:/dev/dri/${DRI_RENDER_1_NAME}
     volumes:
-      # The Intel level-zero GPU driver enumerates via by-path; --device does
-      # not recreate it, it must be mounted explicitly.
-      - /dev/dri/by-path:/dev/dri/by-path:ro
-      - /home/sero/models/q38-pinned:/models
-      - /home/sero/qwen38-b70/entrypoint.sh:/entrypoint.sh:ro
+      # Long bind syntax: PCI by-path names contain colons, which break
+      # the short "src:dst:mode" volume form.
+      - type: bind
+        source: ${DRI_BYPATH_0}
+        target: /dev/dri/by-path/${DRI_BYPATH_0_NAME}
+        read_only: true
+      - type: bind
+        source: ${DRI_BYPATH_1}
+        target: /dev/dri/by-path/${DRI_BYPATH_1_NAME}
+        read_only: true
+      - type: bind
+        source: ${HOST_MODELS_DIR}
+        target: /models
     environment:
-      - MODELS_DIR=/models
-      - GPU_COUNT=2        # 1 or 2 Arc Pro B70s (1 GPU: no TP, higher prefill)
-      - CTX_SIZE_OVERRIDE= # blank = 262144 (2 GPU) / 131072 (1 GPU)
-      - PARALLEL=4
-      - BATCH=8192
-      - UBATCH=8192
-      - ENABLE_MTP=1       # 1 = speculative decoding via mtp-Q4_0 draft
-      - SPEC_DRAFT_N_MAX=5  # max draft tokens per step (5 = sweet spot)
-      - THREADS=16          # CPU threads for target model
-      - DRAFT_THREADS=16    # CPU threads for draft model
-      - DRAFT_NGL=0         # 0 = CPU draft (runs in parallel with GPU target, no contention)
-      - ENABLE_VISION=0    # 1 = image input via mmproj (CPU encoder; GPU offload hangs xe)
-    ipc: host
-    shm_size: 8g
+      MODELS_DIR: /models
+      GPU_COUNT: ${GPU_COUNT:-2}
+      CTX_SIZE: ${CTX_SIZE:-262144}
+      CTX_SIZE_OVERRIDE: ${CTX_SIZE_OVERRIDE:-}
+      PARALLEL: ${PARALLEL:-1}
+      BATCH: ${BATCH:-8192}
+      UBATCH: ${UBATCH:-8192}
+      PORT: ${PORT:-8016}
+      ENABLE_MTP: ${ENABLE_MTP:-0}
+      SPEC_DRAFT_N_MAX: ${SPEC_DRAFT_N_MAX:-5}
+      THREADS: ${THREADS:-16}
+      DRAFT_THREADS: ${DRAFT_THREADS:-16}
+      DRAFT_NGL: ${DRAFT_NGL:-0}
+      ENABLE_VISION: ${ENABLE_VISION:-0}
+      SKIP_DOWNLOAD: ${SKIP_DOWNLOAD:-0}
+      MODEL_REPO: ${MODEL_REPO:-ggml-org/Qwen3.8-27B-GGUF}
+      MODEL_REV: ${MODEL_REV:-0669b98607d47046c7c2b3f801011d54a08cfccf}
+      MODEL_FILE: ${MODEL_FILE:-Qwen3.8-27B-Q4_K_M.gguf}
+      MODEL_SHA256: ${MODEL_SHA256:-31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34}
+      MTP_REPO: ${MTP_REPO:-ggml-org/Qwen3.8-27B-GGUF}
+      MTP_REV: ${MTP_REV:-0669b98607d47046c7c2b3f801011d54a08cfccf}
+      MTP_FILE: ${MTP_FILE:-mtp-Qwen3.8-27B-Q4_0.gguf}
+      MTP_SHA256: ${MTP_SHA256:-}
+      MMPROJ_FILE: ${MMPROJ_FILE:-mmproj-Qwen3.8-27B-Q8_0.gguf}
+      MMPROJ_SHA256: ${MMPROJ_SHA256:-}
+    shm_size: ${SHM_SIZE:-8g}
     ports:
-      - "8010:8010"
+      - "${HOST_PORT:-8016}:${PORT:-8016}"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import os,urllib.request as u; u.urlopen(\"http://127.0.0.1:%s/health\" % os.environ.get(\"PORT\",\"8016\"))'"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 300s

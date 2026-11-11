@@ -121,7 +121,9 @@ the host during the SYCL compile; `-j24` finished in 287.9 s and used about
 `GGML_SYCL_COMM_SINGLE_KERNEL`, `GGML_SYCL_COMM_DIRECT_Q8`, and
 `GGML_SYCL_DEV2DEV_MEMCPY` keep their lab/upstream defaults (`1`, `2`, `0`)
 but can be overridden from `.env` without rebuilding. A commented
-dual-socket profile is in `examples/z8g4.env` (UNDER TEST, not verified).
+dual-socket profile is in `examples/z8g4.env` (verified working on z8g4
+with host-forward copies, but slower than a single GPU; `GPU_COUNT=1` is
+recommended there).
 
 ## Running on z8g4
 
@@ -134,8 +136,10 @@ also present. Ports **8010** (b70a coder), **8012** (b70b reviewer), and
 **8014** (test) are taken. Models live under `/opt/models/<model-name>/`.
 `xpu-smi` is installed; Level Zero 1.34.0.
 
-Bring-up notes, including the still-unresolved TP2 hang, are in
+Bring-up notes are in
 [`docs/z8g4-bringup-2026-11-11.md`](docs/z8g4-bringup-2026-11-11.md).
+On this host, default TP2 hangs or aborts; host-forward TP2 starts but is
+~33% slower than one card, so **`GPU_COUNT=1` is recommended**.
 
 Do this **on z8g4** (this repo does not SSH there):
 
@@ -167,11 +171,15 @@ to the target, or allow download) and `docker compose up -d`.
 ## Measured performance (Q4_K_M, f16 KV)
 
 The tables below are the **published lab figures** for this stack. On z8g4
-(dual-socket, cards on different NUMA nodes) TP2 has not come up yet, so
-the ~51 tok/s decode number has not been reproduced there. Single-GPU mode
-on z8g4 (`GPU_COUNT=1`, 32K context) measured **25.21** and **24.12**
-decode tok/s over 512 tokens (prompt 27 tokens; 29.09 tok/s cold / 100.66
-tok/s warm prefill). See
+(dual-socket, cards on different NUMA nodes) those ~51 tok/s TP2 numbers
+have not been reproduced. Single-GPU mode (`GPU_COUNT=1`, 32K context)
+measured **25.21** and **24.12** decode tok/s over 512 tokens (prompt 27
+tokens; 29.09 tok/s cold / 100.66 tok/s warm prefill). Host-forward TP2
+(`GPU_COUNT=2`, `COMM_SINGLE_KERNEL=0`, `COMM_DIRECT_Q8=0`,
+`DEV2DEV_MEMCPY=2`, 32K context) starts and is healthy, but decode was
+**16.22** and **16.95** tok/s on the same test — about 33% slower than one
+card. Recommendation on z8g4: **`GPU_COUNT=1`**. The published TP2 speed
+likely needs both cards on the same socket or root complex. See
 [`docs/z8g4-bringup-2026-11-11.md`](docs/z8g4-bringup-2026-11-11.md).
 
 ### 2x B70, tensor parallel (`GPU_COUNT=2`)

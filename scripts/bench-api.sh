@@ -2,6 +2,8 @@
 # Hit llama-server /v1/chat/completions: short prompt, ~32k prompt, retrieval check.
 # Usage: ./scripts/bench-api.sh [base_url]
 #   base_url default: http://127.0.0.1:${HOST_PORT:-8016}
+# The 32k prompt is passed via a temp file, not argv (MAX_ARG_STRLEN).
+# If LLAMA_API_KEY is set, it is sent as Authorization: Bearer.
 set -euo pipefail
 
 BASE="${1:-http://127.0.0.1:${HOST_PORT:-8016}}"
@@ -13,10 +15,18 @@ need curl
 need jq
 need python3
 
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+CURL_AUTH=()
+if [ -n "${LLAMA_API_KEY:-}" ]; then
+  CURL_AUTH=(-H "Authorization: Bearer ${LLAMA_API_KEY}")
+fi
+
 echo "Waiting for $BASE/health ..."
 ok=0
 for _ in $(seq 1 60); do
-  if curl -sf "$BASE/health" >/dev/null 2>&1; then
+  if curl -sf "${CURL_AUTH[@]}" "$BASE/health" >/dev/null 2>&1; then
     ok=1
     break
   fi
@@ -34,19 +44,35 @@ SECRET='The retrieval canary is PROJECT-ZEPHYR-4419 and the warehouse code is NX
 
 chat() {
   local prompt="$1" max_tokens="$2"
-  python3 - "$BASE" "$MODEL_NAME" "$prompt" "$max_tokens" <<'PY'
-import json, sys, urllib.request
-base, model, prompt, max_tokens = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+  local prompt_file
+  prompt_file="$(mktemp "$WORKDIR/prompt.XXXXXX")"
+  # The ~32k prompt exceeds Linux MAX_ARG_STRLEN (~128 KiB), so it cannot
+  # be passed as a python argv element or an environment variable.
+  printf '%s' "$prompt" > "$prompt_file"
+  python3 - "$BASE" "$MODEL_NAME" "$prompt_file" "$max_tokens" "${LLAMA_API_KEY:-}" <<'PY'
+import json, pathlib, sys, urllib.request
+
+base, model, prompt_path, max_tokens, api_key = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    int(sys.argv[4]),
+    sys.argv[5],
+)
+prompt = pathlib.Path(prompt_path).read_text()
 body = {
     "model": model,
     "max_tokens": max_tokens,
     "temperature": 0,
     "messages": [{"role": "user", "content": prompt}],
 }
+headers = {"Content-Type": "application/json"}
+if api_key:
+    headers["Authorization"] = "Bearer " + api_key
 req = urllib.request.Request(
     base + "/v1/chat/completions",
     data=json.dumps(body).encode(),
-    headers={"Content-Type": "application/json"},
+    headers=headers,
 )
 with urllib.request.urlopen(req, timeout=3600) as resp:
     sys.stdout.write(resp.read().decode())

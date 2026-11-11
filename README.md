@@ -31,7 +31,13 @@ mounts and also injects the values into the container.
 | `HOST_MODELS_DIR` | `./models` | Host dir mounted at `/models` |
 | `HOST_PORT` / `PORT` | `8016` | Published / listen port |
 | `DRI_RENDER_0/1` | see `.env.example` | Host render nodes to pass (not all of `/dev/dri`) |
-| `DRI_BYPATH_0/1` | see `.env.example` | Matching `/dev/dri/by-path/pci-*-render` entries |
+| `DRI_BYPATH_0/1` | see `.env.example` | Stable PCI by-path names (for the resolver; compose mounts the whole folder) |
+| `BUILD_JOBS` | `24` | `cmake --build` parallelism. `-j88` froze z8g4; `-j24` took 287.9 s, ~40 GB RAM |
+| `HF_TOKEN` | unset | Optional Hugging Face token for downloads. Source from a secrets manager; never commit |
+| `LLAMA_API_KEY` | unset | If set, passed as `llama-server --api-key` |
+| `GGML_SYCL_COMM_SINGLE_KERNEL` | `1` | Cross-GPU comm; overridable. See dual-socket notes |
+| `GGML_SYCL_COMM_DIRECT_Q8` | `2` | Cross-GPU direct Q8 path; overridable |
+| `GGML_SYCL_DEV2DEV_MEMCPY` | `0` | Device-to-device copy mode (`2` = host-forward). Overridable |
 | `GPU_COUNT` | `2` | `1` or `2` Arc GPUs (`1`: no TP, higher prefill) |
 | `CTX_SIZE` | `262144` | Context on 2 GPUs |
 | `CTX_SIZE_OVERRIDE` | blank | If set, wins; 1 GPU still defaults to 131072 when blank |
@@ -60,9 +66,23 @@ see **only** the Arc cards you intend to use.
    `DRI_BYPATH_*_NAME` in `.env`. The `*_NAME` values are the basename so the
    nodes keep the same names inside the container.
 
-**`/dev/dri/by-path` must be mounted** (done in compose for the selected
-entries). The Intel Level Zero driver enumerates GPUs through it;
-`--device /dev/dri/renderD*` alone leaves adapters invisible.
+**Render node numbers can change after a reboot**; PCI addresses do not. On
+z8g4 the second B70 moved from `renderD130` to `renderD131`, which showed up
+as `invalid device: SYCL1`. Recheck `DRI_RENDER_*` against
+`ls -l /dev/dri/by-path` after every reboot, or run:
+
+```bash
+./scripts/resolve-dri-from-bypath.sh --write .env
+```
+
+The helper has to run on the host. Docker passes render nodes in `devices:`
+at container create time, so the entrypoint cannot fix a stale mapping.
+
+**`/dev/dri/by-path` must be mounted.** Compose bind-mounts the whole folder
+read-only (`/dev/dri/by-path:/dev/dri/by-path:ro`). Per-device binds of
+`pci-0000:XX:00.0-render` names fail with `invalid volume specification`
+because of the colons. The Intel Level Zero driver enumerates GPUs through
+this folder; `--device /dev/dri/renderD*` alone leaves adapters invisible.
 
 If devices still do not enumerate, also pass the matching `pci-*-card` nodes
 the same way (not enabled by default).
@@ -79,13 +99,47 @@ staging. The container is not privileged and does not bind the whole
 Place `MODEL_FILE` in `HOST_MODELS_DIR` and set `SKIP_DOWNLOAD=1`. The
 entrypoint still runs `sha256sum` against `MODEL_SHA256`.
 
+### Hugging Face token and API key
+
+For a first-time download, pass `HF_TOKEN` in the environment (compose
+forwards `${HF_TOKEN:-}` into the container). Source it from a secrets
+manager or a local untracked `.env`. **Never commit a token.**
+
+`LLAMA_API_KEY`, if set, is passed to `llama-server --api-key`. Without a
+key the server warns that CORS is `*`. `scripts/bench-api.sh` and the
+compose healthcheck send `Authorization: Bearer` when this variable is set.
+
+### Build parallelism
+
+The image build defaults to `BUILD_JOBS=24`. On z8g4, `-j88` (`nproc`) froze
+the host during the SYCL compile; `-j24` finished in 287.9 s and used about
+40 GB of RAM. Override with `BUILD_JOBS` in `.env` or
+`docker compose build --build-arg BUILD_JOBS=16`.
+
+### Cross-GPU communication
+
+`GGML_SYCL_COMM_SINGLE_KERNEL`, `GGML_SYCL_COMM_DIRECT_Q8`, and
+`GGML_SYCL_DEV2DEV_MEMCPY` keep their lab/upstream defaults (`1`, `2`, `0`)
+but can be overridden from `.env` without rebuilding. A commented
+dual-socket profile is in `examples/z8g4.env` (verified working on z8g4
+with host-forward copies, but slower than a single GPU; `GPU_COUNT=1` is
+recommended there).
+
 ## Running on z8g4
 
-Host facts: Ubuntu, Docker, 2× Arc Pro B70 at **renderD129 / renderD130**
-(PCI `0000:17:00.0` and `0000:9b:00.0`), plus an RTX 5060 Ti and other
-render nodes. Ports **8010** (b70a coder), **8012** (b70b reviewer), and
+Host facts: HP dual-socket, 88 cores, 231 GB RAM, Ubuntu, Docker. 2× Arc Pro
+B70 (BMG_G31_B70, `0xE223`) at PCI `0000:17:00.0` (NUMA 0) and
+`0000:9b:00.0` (NUMA 1) — the cards are on **different CPU sockets**. After
+the 2026-11-11 reboot those cards were **renderD129 / renderD131** (they had
+been renderD129 / renderD130). An RTX 5060 Ti and other render nodes are
+also present. Ports **8010** (b70a coder), **8012** (b70b reviewer), and
 **8014** (test) are taken. Models live under `/opt/models/<model-name>/`.
 `xpu-smi` is installed; Level Zero 1.34.0.
+
+Bring-up notes are in
+[`docs/z8g4-bringup-2026-11-11.md`](docs/z8g4-bringup-2026-11-11.md).
+On this host, default TP2 hangs or aborts; host-forward TP2 starts but is
+~33% slower than one card, so **`GPU_COUNT=1` is recommended**.
 
 Do this **on z8g4** (this repo does not SSH there):
 
@@ -94,8 +148,9 @@ git clone https://github.com/rtb144/qwen38-b70.git
 cd qwen38-b70
 cp examples/z8g4.env .env
 
-# Confirm the B70 render nodes still match the env file
+# Render nodes can renumber after a reboot — recheck or rewrite .env
 ./scripts/find-intel-render-nodes.sh
+./scripts/resolve-dri-from-bypath.sh --write .env
 
 # If the GGUF is already at /opt/models/Qwen3.8-27B-GGUF/, keep SKIP_DOWNLOAD=1.
 # Otherwise set SKIP_DOWNLOAD=0 in .env for a first-time Hugging Face fetch.
@@ -114,6 +169,18 @@ To enable MTP later: set `ENABLE_MTP=1` in `.env` (and put the draft GGUF next
 to the target, or allow download) and `docker compose up -d`.
 
 ## Measured performance (Q4_K_M, f16 KV)
+
+The tables below are the **published lab figures** for this stack. On z8g4
+(dual-socket, cards on different NUMA nodes) those ~51 tok/s TP2 numbers
+have not been reproduced. Single-GPU mode (`GPU_COUNT=1`, 32K context)
+measured **25.21** and **24.12** decode tok/s over 512 tokens (prompt 27
+tokens; 29.09 tok/s cold / 100.66 tok/s warm prefill). Host-forward TP2
+(`GPU_COUNT=2`, `COMM_SINGLE_KERNEL=0`, `COMM_DIRECT_Q8=0`,
+`DEV2DEV_MEMCPY=2`, 32K context) starts and is healthy, but decode was
+**16.22** and **16.95** tok/s on the same test — about 33% slower than one
+card. Recommendation on z8g4: **`GPU_COUNT=1`**. The published TP2 speed
+likely needs both cards on the same socket or root complex. See
+[`docs/z8g4-bringup-2026-11-11.md`](docs/z8g4-bringup-2026-11-11.md).
 
 ### 2x B70, tensor parallel (`GPU_COUNT=2`)
 

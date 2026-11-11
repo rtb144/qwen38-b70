@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# setvars.sh references unset variables and exits 1 under `set -u`.
+set +u
 # shellcheck disable=SC1091
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+set -u
 
 MODELS_DIR="${MODELS_DIR:-/models}"
 GPU_COUNT="${GPU_COUNT:-2}"
@@ -80,10 +83,13 @@ if [ "$ENABLE_VISION" = "1" ]; then
     MM_ARGS=(--no-mmproj-offload --mmproj "$MMPROJ_PATH")
 fi
 
-# Lab runtime environment (b70-optimization-lab qwen38-27b-q4km-tp2 config.env)
+# Lab runtime environment (b70-optimization-lab qwen38-27b-q4km-tp2 config.env).
+# Cross-GPU comm knobs are overridable from the environment so a dual-socket
+# host can test host-forward copies without rebuilding the image. Defaults
+# match the lab/upstream values (SINGLE_KERNEL=1, DIRECT_Q8=2, DEV2DEV=0).
 export UR_L0_USE_IMMEDIATE_COMMANDLISTS=1
 export UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1
-export GGML_SYCL_COMM_SINGLE_KERNEL=1
+export GGML_SYCL_COMM_SINGLE_KERNEL="${GGML_SYCL_COMM_SINGLE_KERNEL:-1}"
 export GGML_META_FUSE_ALLREDUCE_ADD=1
 export GGML_META_FUSE_ALLREDUCE_ADD_RMS_MUL=1
 export GGML_SYCL_COMM_FUSED_Q8=1
@@ -94,7 +100,8 @@ export GGML_SYCL_FUSED_GDN_BETA_SIGMOID=1
 export GGML_SYCL_FUSED_CONCAT_STATE=1
 export GGML_SYCL_FUSED_GDN_STATE_IO=1
 export GGML_SYCL_FUSED_CONV_STATE_IO=1
-export GGML_SYCL_COMM_DIRECT_Q8=2
+export GGML_SYCL_COMM_DIRECT_Q8="${GGML_SYCL_COMM_DIRECT_Q8:-2}"
+export GGML_SYCL_DEV2DEV_MEMCPY="${GGML_SYCL_DEV2DEV_MEMCPY:-0}"
 export GGML_SYCL_FUSED_ROPE_SET_ROWS=1
 export GGML_SYCL_COMM_REDUCE_VEC4=1
 export GGML_SYCL_FUSED_QK_NORM_ROPE=1
@@ -113,10 +120,16 @@ export GGML_SYCL_FUSED_MMVQ_TRIPLE_ATTN=0
 export GGML_SYCL_FUSED_MMVQ_TRIPLE_GDN=0
 export GGML_SYCL_FUSED_MMVQ_QUAD_GDN=0
 
+API_KEY_ARGS=()
+if [ -n "${LLAMA_API_KEY:-}" ]; then
+    API_KEY_ARGS=(--api-key "$LLAMA_API_KEY")
+fi
+
 exec /build/llama.cpp/build-sycl/bin/llama-server \
     --model "$TARGET" \
     "${MM_ARGS[@]}" \
     "${DRAFT_ARGS[@]}" \
+    "${API_KEY_ARGS[@]}" \
     --host 0.0.0.0 --port "$PORT" \
     "${DEVICE_ARGS[@]}" \
     --gpu-layers 99 \

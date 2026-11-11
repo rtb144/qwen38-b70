@@ -1,21 +1,117 @@
 # qwen38-b70
 
-One-command Qwen3.8-27B inference server on **two Intel Arc Pro B70 GPUs**,
-tensor-parallel llama.cpp (SYCL), 262k context, OpenAI-compatible API.
+One-command **llama.cpp SYCL** tensor-parallel server, defaulting to
+Qwen3.8-27B on **two Intel Arc Pro B70 GPUs**, 262k context, OpenAI-compatible
+API. Host paths, ports, render nodes, and model pins are set in `.env`.
 
 ```bash
-docker compose up -d
+cp .env.example .env          # or: cp examples/z8g4.env .env
+# edit DRI_* / HOST_MODELS_DIR / HOST_PORT
+docker compose up -d --build
 ```
 
-That is the whole setup. On first start it downloads the pinned,
-SHA-256-verified model (~19 GB) into `./models`, then serves on port **8010**.
+On first start (unless `SKIP_DOWNLOAD=1`) it downloads the pinned,
+SHA-256-verified GGUF into the host model directory, then serves on
+**${HOST_PORT}** (default **8016**).
 
 ```bash
-curl http://localhost:8010/v1/chat/completions \
+curl http://localhost:8016/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.8-27b","max_tokens":64,
        "messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+## Configuration
+
+Copy `.env.example` to `.env`. Compose interpolates that file for device
+mounts and also injects the values into the container.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `HOST_MODELS_DIR` | `./models` | Host dir mounted at `/models` |
+| `HOST_PORT` / `PORT` | `8016` | Published / listen port |
+| `DRI_RENDER_0/1` | see `.env.example` | Host render nodes to pass (not all of `/dev/dri`) |
+| `DRI_BYPATH_0/1` | see `.env.example` | Matching `/dev/dri/by-path/pci-*-render` entries |
+| `GPU_COUNT` | `2` | `1` or `2` Arc GPUs (`1`: no TP, higher prefill) |
+| `CTX_SIZE` | `262144` | Context on 2 GPUs |
+| `CTX_SIZE_OVERRIDE` | blank | If set, wins; 1 GPU still defaults to 131072 when blank |
+| `PARALLEL` | `1` | Concurrent request slots |
+| `BATCH` / `UBATCH` | `8192` | Prefill batch; 8192 maximizes prefill |
+| `ENABLE_MTP` | `0` | `1` = speculative decoding (mtp-Q4_0 draft) |
+| `SPEC_DRAFT_N_MAX` | `5` | Draft tokens per step when MTP is on |
+| `THREADS` | `16` | CPU threads for the target model |
+| `ENABLE_VISION` | `0` | `1` = image input (mmproj Q8_0, CPU encoder) |
+| `SKIP_DOWNLOAD` | `0` | `1` = require a local GGUF; no Hugging Face call |
+| `MODEL_REPO` / `MODEL_REV` / `MODEL_FILE` / `MODEL_SHA256` | pinned Qwen3.8-27B Q4_K_M | Any GGUF; SHA-256 is required for the target |
+| `MTP_*` / `MMPROJ_*` | same repo/rev, optional SHA | Draft / projector files |
+
+Defaults match this README (`PARALLEL=1`, `ENABLE_MTP=0`). They are not the
+old lab compose override (`PARALLEL=4`, `ENABLE_MTP=1`).
+
+### GPU selection (do not pass all of `/dev/dri`)
+
+On a mixed host (Intel Arc + NVIDIA + extra render nodes) the container must
+see **only** the Arc cards you intend to use.
+
+1. On the GPU host run `./scripts/find-intel-render-nodes.sh`.
+2. Match PCI IDs (`lspci`, `xpu-smi discovery`) to
+   `/dev/dri/by-path/pci-<addr>-render` → `../renderD*`.
+3. Set `DRI_RENDER_*`, `DRI_RENDER_*_NAME`, `DRI_BYPATH_*`, and
+   `DRI_BYPATH_*_NAME` in `.env`. The `*_NAME` values are the basename so the
+   nodes keep the same names inside the container.
+
+**`/dev/dri/by-path` must be mounted** (done in compose for the selected
+entries). The Intel Level Zero driver enumerates GPUs through it;
+`--device /dev/dri/renderD*` alone leaves adapters invisible.
+
+If devices still do not enumerate, also pass the matching `pci-*-card` nodes
+the same way (not enabled by default).
+
+### ipc / devices
+
+`ipc: host` is **not** set. This server is one process with two SYCL devices;
+host IPC was a vLLM leftover. `shm_size` (default 8g) is kept for SYCL/USM
+staging. The container is not privileged and does not bind the whole
+`/dev/dri` tree.
+
+### Local model, no network
+
+Place `MODEL_FILE` in `HOST_MODELS_DIR` and set `SKIP_DOWNLOAD=1`. The
+entrypoint still runs `sha256sum` against `MODEL_SHA256`.
+
+## Running on z8g4
+
+Host facts: Ubuntu, Docker, 2× Arc Pro B70 at **renderD129 / renderD130**
+(PCI `0000:17:00.0` and `0000:9b:00.0`), plus an RTX 5060 Ti and other
+render nodes. Ports **8010** (b70a coder), **8012** (b70b reviewer), and
+**8014** (test) are taken. Models live under `/opt/models/<model-name>/`.
+`xpu-smi` is installed; Level Zero 1.34.0.
+
+Do this **on z8g4** (this repo does not SSH there):
+
+```bash
+git clone https://github.com/rtb144/qwen38-b70.git
+cd qwen38-b70
+cp examples/z8g4.env .env
+
+# Confirm the B70 render nodes still match the env file
+./scripts/find-intel-render-nodes.sh
+
+# If the GGUF is already at /opt/models/Qwen3.8-27B-GGUF/, keep SKIP_DOWNLOAD=1.
+# Otherwise set SKIP_DOWNLOAD=0 in .env for a first-time Hugging Face fetch.
+
+docker compose build
+docker compose up -d
+docker compose ps
+curl -sS http://127.0.0.1:8016/health
+
+# Timings (prompt + generation tok/s) at a short prompt and ~32k, plus a
+# needle-in-haystack retrieval check:
+./scripts/bench-api.sh http://127.0.0.1:8016
+```
+
+To enable MTP later: set `ENABLE_MTP=1` in `.env` (and put the draft GGUF next
+to the target, or allow download) and `docker compose up -d`.
 
 ## Measured performance (Q4_K_M, f16 KV)
 
@@ -66,35 +162,24 @@ Decode is nearly flat with context: only 16 of 64 layers are full attention
   [b70-optimization-lab](https://github.com/steveseguin/b70-optimization-lab)
   full TP2 stack (`dp4a2` patch, decoded SHA-256
   `f21e9b55…`) + Q4K increment (`0a278585…`). Both digests verified against
-  the lab's published values.
-- **Model**: `ggml-org/Qwen3.8-27B-GGUF` @ `0669b986`, `Qwen3.8-27B-Q4_K_M.gguf`,
-  SHA-256 checked at every container start.
+  the lab's published values at image build.
+- **Default model**: `ggml-org/Qwen3.8-27B-GGUF` @ `0669b986`,
+  `Qwen3.8-27B-Q4_K_M.gguf`, SHA-256 checked at every container start.
+- **Base image**: `intel/oneapi-basekit:2025.3.2-0-devel-ubuntu24.04` pinned
+  by manifest digest `sha256:79a5e333ff6f…`.
 - **Build**: SYCL JIT via Intel oneAPI DPC++ 2025.3.3. AOT `bmg_g31` builds
   work under oneAPI 2026.1.1, but that runtime's UR level-zero adapter does not
   enumerate devices on any publicly available GPU userspace today; JIT is the
   verified-working path and reaches decode parity with the lab's promoted
   record (51 tok/s vs 49.7).
 
-## Options (docker-compose `environment`)
-
-| Variable      | Default | Meaning                                          |
-|---------------|---------|--------------------------------------------------|
-| `GPU_COUNT`   | 2       | `1` or `2` Arc Pro B70s (1 GPU: higher prefill)  |
-| `CTX_SIZE_OVERRIDE` | — | Blank: 262144 (2 GPU) / 131072 (1 GPU)        |
-| `PARALLEL`    | 1       | Concurrent request slots                         |
-| `ENABLE_MTP`  | 0       | `1` = speculative decoding (mtp-Q4_0 draft)      |
-| `ENABLE_VISION` | 0     | `1` = image input (mmproj Q8_0, CPU encoder)     |
-| `BATCH`/`UBATCH` | 8192 | Prefill batch; 8192 maximizes prefill throughput |
-
-## Notes
-
-- `/dev/dri/by-path` must be mounted (done in compose): the Intel level-zero
-  driver enumerates GPUs through it and `--device /dev/dri` alone leaves the
-  GPUs invisible.
 - The Q4K reorder-family fused kernels are disabled by default: they assume the
   lab AOT build's reordered tensor layout and corrupt output otherwise.
 - Tested on: Arch kernel 7.1.8 (xe driver), 2x Arc Pro B70 (Battlemage G31),
   oneAPI 2025.3.3 container image.
+
+One-off vLLM / sglang lab launchers live in [`experimental/`](experimental/)
+(contents unchanged). The llama.cpp compose path does not use them.
 
 ## sglang XPU — not viable (2026-08)
 
@@ -136,17 +221,20 @@ with 4 concurrent request streams, exceeding the 120 tok/s target.
 
 ### How to run TP2
 
+Scripts are under `experimental/` (historical lab launchers; not used by
+`docker compose`).
+
 ```bash
 # 1. Copy the TP2 launch script to the host
-scp lab_tp2_batch_mtp.sh omarchy:/tmp/lab_tp2_batch_mtp.sh
+scp experimental/lab_tp2_batch_mtp.sh HOST:/tmp/lab_tp2_batch_mtp.sh
 
 # 2. Launch (auto-retries on intermittent XCCL failures)
-scp launch_tp2_retry.sh omarchy:/tmp/launch_tp2_retry.sh
-ssh omarchy 'bash /tmp/launch_tp2_retry.sh'
+scp experimental/launch_tp2_retry.sh HOST:/tmp/launch_tp2_retry.sh
+ssh HOST 'bash /tmp/launch_tp2_retry.sh'
 
 # 3. Benchmark
-scp bench_concurrent_stable.sh omarchy:/tmp/bench_concurrent_stable.sh
-ssh omarchy 'bash /tmp/bench_concurrent_stable.sh 4 5'
+scp experimental/bench_concurrent_stable.sh HOST:/tmp/bench_concurrent_stable.sh
+ssh HOST 'bash /tmp/bench_concurrent_stable.sh 4 5'
 ```
 
 ### Patches applied (all in the launch script, no image rebuild needed)

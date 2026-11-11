@@ -5,11 +5,11 @@
 # Prints one JSON line: {"decode_tok_s":..,"prefill_tok_s":..,"coherent":..,...}
 set -u
 HOST="${1:-localhost}"
-PORT=8010
+PORT="${2:-${HOST_PORT:-8016}}"
 URL="http://$HOST:$PORT"
 
 # Wait for health (up to 180s)
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   curl -sf "$URL/health" >/dev/null 2>&1 && break
   sleep 3
 done
@@ -18,11 +18,11 @@ curl -sf "$URL/health" >/dev/null 2>&1 || { echo '{"error":"server not healthy"}
 # Build a ~2.5k-token prompt by repeating a dense paragraph.
 PARA="The Gated Delta Network is a linear-attention variant that replaces softmax with a gated delta rule update over a recurrent state. Each layer maintains a fixed-size state matrix that is updated in O(1) per token, independent of sequence length, which makes decode throughput nearly flat with context. The delta rule is h = h + g * (v - h . k) where g is a data-dependent sigmoid gate, k a key, and v a value. Aggressive negative g values cause rapid forgetting of old state, keeping the state bounded. Full attention is used every fourth layer to recover exact long-range tokens that the linear path would otherwise forget."
 PROMPT=""
-for i in $(seq 1 28); do PROMPT="$PROMPT$PARA "; done
+for _ in $(seq 1 28); do PROMPT="$PROMPT$PARA "; done
 
 # 3 throughput runs (hard task), collect decode tok/s
 HARD_TPS=()
-for run in 1 2 3; do
+for _run in 1 2 3; do
   RESP=$(curl -s "$URL/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d "$(jq -nc --arg p "$PROMPT" '{model:"qwen3.8-27b",max_tokens:256,temperature:0,messages:[{role:"user",content:("Answer in one sentence: what is the mechanism described in the following text?\n\n"+$p)}]}')")
@@ -40,7 +40,7 @@ N_IN=$(echo "$RESP" | jq -r '.usage.prompt_tokens // 0')
 
 # Easy-task decode (high MTP acceptance): count from 1 to 100. 2 runs, median.
 EASY_TPS=()
-for run in 1 2; do
+for _run in 1 2; do
   EASY_RESP=$(curl -s "$URL/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{"model":"qwen3.8-27b","max_tokens":256,"temperature":0,"messages":[{"role":"user","content":"Count from 1 to 100, one number per line."}]}')

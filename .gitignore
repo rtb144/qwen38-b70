@@ -1,0 +1,5 @@
+.env
+models/
+*.log
+compile_cache/
+hillclimb.lock

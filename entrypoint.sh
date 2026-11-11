@@ -1,49 +1,83 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
+# shellcheck disable=SC1091
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 
 MODELS_DIR="${MODELS_DIR:-/models}"
-GPU_COUNT="${GPU_COUNT:-2}"        # 1 or 2 Arc Pro B70s
-CTX_SIZE="${CTX_SIZE:-262144}"     # default for 2 GPUs; 1 GPU defaults to 131072
+GPU_COUNT="${GPU_COUNT:-2}"
+CTX_SIZE="${CTX_SIZE:-262144}"
 PARALLEL="${PARALLEL:-1}"
 BATCH="${BATCH:-8192}"
 UBATCH="${UBATCH:-8192}"
-PORT="${PORT:-8010}"
+PORT="${PORT:-8016}"
 ENABLE_MTP="${ENABLE_MTP:-0}"
 ENABLE_VISION="${ENABLE_VISION:-0}"
+SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
+THREADS="${THREADS:-16}"
 
 if [ "$GPU_COUNT" = "1" ]; then
     DEVICE_ARGS=(--device SYCL0)
     CTX_SIZE="${CTX_SIZE_OVERRIDE:-131072}"
 else
-    DEVICE_ARGS=(--device SYCL0,SYCL1 --split-mode tensor --tensor-split 1,1)
+    DEVICE_ARGS=(--device "SYCL0,SYCL1" --split-mode tensor --tensor-split "1,1")
     CTX_SIZE="${CTX_SIZE_OVERRIDE:-$CTX_SIZE}"
 fi
 
-# Download + verify the pinned target model on first run
-TARGET="$MODELS_DIR/$MODEL_FILE"
-if [ ! -f "$TARGET" ]; then
-    echo "[entrypoint] downloading $MODEL_REPO/$MODEL_FILE @$MODEL_REV ..."
-    hf download "$MODEL_REPO" "$MODEL_FILE" --revision "$MODEL_REV" --local-dir "$MODELS_DIR"
-fi
-echo "$MODEL_SHA256  $TARGET" | sha256sum -c - || { echo "[entrypoint] SHA-256 mismatch!"; exit 1; }
+download_if_needed() {
+    local dest="$1" repo="$2" file="$3" rev="$4"
+    if [ -f "$dest" ]; then
+        return 0
+    fi
+    if [ "$SKIP_DOWNLOAD" = "1" ]; then
+        echo "[entrypoint] missing $dest (SKIP_DOWNLOAD=1; place the file on the host model dir)"
+        exit 1
+    fi
+    echo "[entrypoint] downloading $repo/$file @$rev ..."
+    hf download "$repo" "$file" --revision "$rev" --local-dir "$MODELS_DIR"
+}
 
-# Optional MTP draft sidecar (speculative decoding)
+verify_sha() {
+    local dest="$1" digest="$2" label="$3"
+    if [ -z "$digest" ]; then
+        echo "[entrypoint] WARNING: no SHA-256 configured for $label, skipping verify"
+        return 0
+    fi
+    echo "$digest  $dest" | sha256sum -c - || {
+        echo "[entrypoint] SHA-256 mismatch for $label"
+        exit 1
+    }
+}
+
+TARGET="$MODELS_DIR/${MODEL_FILE:?MODEL_FILE is required}"
+download_if_needed "$TARGET" "${MODEL_REPO:?MODEL_REPO is required}" "$MODEL_FILE" "${MODEL_REV:?MODEL_REV is required}"
+verify_sha "$TARGET" "${MODEL_SHA256:?MODEL_SHA256 is required}" "$MODEL_FILE"
+
 DRAFT_ARGS=()
 if [ "$ENABLE_MTP" = "1" ]; then
-    if [ ! -f "$MODELS_DIR/$MTP_FILE" ]; then
-        hf download "$MODEL_REPO" "$MTP_FILE" --revision "$MODEL_REV" --local-dir "$MODELS_DIR"
-    fi
-    DRAFT_ARGS=(--spec-type draft-mtp --model-draft "$MODELS_DIR/$MTP_FILE" --spec-draft-n-max "${SPEC_DRAFT_N_MAX:-8}" --spec-draft-threads "${DRAFT_THREADS:-16}" --spec-draft-poll 1 --spec-draft-ngl "${DRAFT_NGL:-0}" --spec-draft-device "${DRAFT_DEVICE:-SYCL0}")
+    MTP_REPO="${MTP_REPO:-$MODEL_REPO}"
+    MTP_REV="${MTP_REV:-$MODEL_REV}"
+    MTP_PATH="$MODELS_DIR/${MTP_FILE:?MTP_FILE is required when ENABLE_MTP=1}"
+    download_if_needed "$MTP_PATH" "$MTP_REPO" "$MTP_FILE" "$MTP_REV"
+    verify_sha "$MTP_PATH" "${MTP_SHA256:-}" "$MTP_FILE"
+    DRAFT_ARGS=(
+        --spec-type draft-mtp
+        --model-draft "$MTP_PATH"
+        --spec-draft-n-max "${SPEC_DRAFT_N_MAX:-5}"
+        --spec-draft-threads "${DRAFT_THREADS:-16}"
+        --spec-draft-poll 1
+        --spec-draft-ngl "${DRAFT_NGL:-0}"
+        --spec-draft-device "${DRAFT_DEVICE:-SYCL0}"
+    )
 fi
 
-# Optional vision projector (image input; encoder on CPU — GPU offload hangs the xe driver)
 MM_ARGS=()
 if [ "$ENABLE_VISION" = "1" ]; then
-    if [ ! -f "$MODELS_DIR/$MMPROJ_FILE" ]; then
-        hf download "$MODEL_REPO" "$MMPROJ_FILE" --revision "$MODEL_REV" --local-dir "$MODELS_DIR"
-    fi
-    MM_ARGS=(--no-mmproj-offload --mmproj "$MODELS_DIR/$MMPROJ_FILE")
+    MMPROJ_REPO="${MMPROJ_REPO:-$MODEL_REPO}"
+    MMPROJ_REV="${MMPROJ_REV:-$MODEL_REV}"
+    MMPROJ_PATH="$MODELS_DIR/${MMPROJ_FILE:?MMPROJ_FILE is required when ENABLE_VISION=1}"
+    download_if_needed "$MMPROJ_PATH" "$MMPROJ_REPO" "$MMPROJ_FILE" "$MMPROJ_REV"
+    verify_sha "$MMPROJ_PATH" "${MMPROJ_SHA256:-}" "$MMPROJ_FILE"
+    MM_ARGS=(--no-mmproj-offload --mmproj "$MMPROJ_PATH")
 fi
 
 # Lab runtime environment (b70-optimization-lab qwen38-27b-q4km-tp2 config.env)
@@ -95,7 +129,7 @@ exec /build/llama.cpp/build-sycl/bin/llama-server \
     --ctx-checkpoints 0 \
     --fit off \
     --reasoning off \
-    --threads "${THREADS:-8}" \
+    --threads "$THREADS" \
     --poll 50 \
     --ctx-size "$CTX_SIZE" \
     --parallel "$PARALLEL" \
